@@ -12,9 +12,9 @@ async fn main() {
 }
 
 mod audio {
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
 
-    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::{self};
 
     #[derive(Debug, Clone)]
     pub enum Message {
@@ -31,6 +31,8 @@ mod audio {
         while let Some(event) = status_receiver.recv().await {
             let _ = output.send(event).await;
         }
+
+        println!("Subscription ended.")
     }
 
     fn run_audio_backend(status: mpsc::Sender<Message>) {
@@ -39,11 +41,11 @@ mod audio {
         loop {
             match state {
                 State::NotConnected(retry_count) => {
-                    let (closed_sender, closed_receiver) = mpsc::channel(1);
-                    match start_jack_client(closed_sender) {
+                    let close_channel = Arc::new(signal_hook::low_level::channel::Channel::new());
+                    match start_jack_client(close_channel.clone()) {
                         Ok(client) => {
                             let _ = status.blocking_send(Message::Ready);
-                            state = State::Connected(client, closed_receiver);
+                            state = State::Connected(client, close_channel);
                         }
                         Err(err) => {
                             let _ = status.blocking_send(Message::Error(err));
@@ -52,14 +54,19 @@ mod audio {
                     };
                 }
                 State::Connected(client, ref mut closed) => {
-                    let _ = closed.blocking_recv();
-
-                    let _ = status.blocking_send(Message::Error(Error::ConnectionLost));
-                    if let Err(err) = client.deactivate() {
-                        let _ = status.blocking_send(Message::Error(err.into()));
+                    while let None = closed.recv() {
+                        std::thread::sleep(Duration::from_millis(10));
                     }
 
-                    state = State::NotConnected(0);
+                    status
+                        .try_send(Message::Error(Error::ConnectionLost))
+                        .unwrap();
+
+                    if let Err(err) = client.deactivate() {
+                        status.try_send(Message::Error(err.into())).unwrap();
+                    }
+
+                    state = State::Error(0);
                 }
                 State::Error(retry_count) => {
                     dbg!("error, retrying: {retry_count}");
@@ -79,7 +86,7 @@ mod audio {
     }
 
     fn start_jack_client(
-        close: mpsc::Sender<()>,
+        close: Arc<signal_hook::low_level::channel::Channel<bool>>,
     ) -> Result<jack::AsyncClient<Notifications, Process>, Error> {
         let (client, _status) =
             jack::Client::new("threading_test", jack::ClientOptions::NO_START_SERVER)?;
@@ -91,19 +98,19 @@ mod audio {
         NotConnected(u64),
         Connected(
             jack::AsyncClient<Notifications, Process>,
-            mpsc::Receiver<()>,
+            Arc<signal_hook::low_level::channel::Channel<bool>>,
         ),
         Error(u64),
     }
 
-    struct Notifications(mpsc::Sender<()>);
+    struct Notifications(Arc<signal_hook::low_level::channel::Channel<bool>>);
     struct Process;
 
     impl jack::NotificationHandler for Notifications {
         fn thread_init(&self, _: &jack::Client) {}
 
         unsafe fn shutdown(&mut self, _status: jack::ClientStatus, _reason: &str) {
-            let _ = self.0.try_send(());
+            self.0.send(true);
         }
 
         fn freewheel(&mut self, _: &jack::Client, _is_freewheel_enabled: bool) {}
