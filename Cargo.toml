@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-tokio = {version = "1.0", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 jack = "0.13"
 signal-hook = { version = "0.3", features = ["channel"], default-features = false }
 thiserror = "2"

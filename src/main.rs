@@ -1,178 +1,93 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
-use audio::run_audio_backend;
-use tokio::sync::mpsc;
+fn main() -> ! {
+    let closed = Arc::new(AtomicBool::new(false));
+    let mut state = State::NotConnected(0);
 
-// #[tokio::main]
-// async fn main() {
-fn main() {
-    // let (sender, mut receiver) = mpsc::channel(100);
-
-    // tokio::task::spawn(audio::run_subscription(sender));
-
-    // while let Some(message) = receiver.recv().await {
-    //     dbg!(message);
-    // }
-    let (status_sender, mut status_receiver) = mpsc::channel(100);
-
-    std::thread::spawn(|| run_audio_backend(status_sender));
-
-    std::thread::spawn(move || {
-        loop {
-            if let Ok(event) = status_receiver.try_recv() {
-                dbg!(event);
+    loop {
+        match state {
+            State::NotConnected(retry_count) => {
+                println!("trying to connect, retry #{retry_count}");
+                match audio::start_jack_client(closed.clone()) {
+                    Ok(client) => state = State::Connected(client),
+                    Err(err) => {
+                        dbg!(err);
+                        state = State::Error(retry_count);
+                    }
+                }
             }
-            std::thread::sleep(Duration::from_millis(500));
+            State::Connected(client) => {
+                while closed.load(std::sync::atomic::Ordering::Relaxed) != true {
+                    println!("tick");
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+
+                // deadlocks here
+                println!("deactivate client");
+                match client.deactivate() {
+                    Ok((client, _notification, _handler)) => {
+                        dbg!(&client);
+                    }
+                    Err(err) => {
+                        dbg!(err);
+                    }
+                }
+                println!("client deactivated");
+
+                state = State::Error(0);
+            }
+            State::Error(retry_count) => {
+                println!("error, retrying: {retry_count}");
+                const SLEEP_TIME_BASE: u64 = 3;
+
+                let timeout = retry_count * SLEEP_TIME_BASE;
+                let timeout = Duration::from_secs(timeout);
+
+                std::thread::sleep(timeout);
+
+                state = State::NotConnected(retry_count + 1);
+            }
         }
-        // while let Ok(event) = status_receiver.try_recv() {
-        //     dbg!(event);
-        // }
-    })
-    .join()
-    .unwrap()
+    }
+}
+
+enum State {
+    NotConnected(u64),
+    Connected(jack::AsyncClient<audio::Notifications, audio::Process>),
+    Error(u64),
 }
 
 mod audio {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::{Arc, atomic::AtomicBool};
 
-    use tokio::sync::{
-        mpsc::{self},
-        oneshot,
-    };
-
-    #[derive(Debug, Clone)]
-    pub enum Message {
-        Ready,
-        Error(Error),
-        RetryIn(Duration),
-    }
-
-    pub async fn run_subscription(output: mpsc::Sender<Message>) {
-        let (status_sender, mut status_receiver) = mpsc::channel(100);
-
-        std::thread::spawn(|| run_audio_backend(status_sender));
-
-        while let Some(event) = status_receiver.recv().await {
-            let _ = output.send(event).await;
-        }
-
-        println!("Subscription ended.")
-    }
-
-    pub fn run_audio_backend(status: mpsc::Sender<Message>) {
-        let mut state = State::NotConnected(0);
-
-        loop {
-            match state {
-                State::NotConnected(retry_count) => {
-                    let close_channel = Arc::new(signal_hook::low_level::channel::Channel::new());
-
-                    let (result_tx, result_rx) = oneshot::channel();
-                    let (shutdown, mut shutdown_rx) = oneshot::channel();
-
-                    let close = close_channel.clone();
-                    std::thread::spawn(move || {
-                        let _client = match start_jack_client(close) {
-                            Ok(client) => {
-                                result_tx.send(Ok(())).unwrap();
-                                client
-                            }
-                            Err(err) => {
-                                result_tx.send(Err(err)).unwrap();
-                                return;
-                            }
-                        };
-
-                        while let Err(_) = shutdown_rx.try_recv() {
-                            println!("worker tick");
-                            std::thread::sleep(Duration::from_millis(500));
-                        }
-
-                        println!("deactivate client");
-                        // SEGFAULT directly
-                        // let _ = client.deactivate().unwrap();
-                        std::thread::sleep(Duration::from_secs(3));
-                        println!("client deactivated");
-                        // SEGFAULT on drop
-                    });
-
-                    match result_rx.blocking_recv().unwrap() {
-                        Ok(_) => {
-                            let _ = status.blocking_send(Message::Ready);
-                            state = State::Connected(close_channel, shutdown);
-                        }
-                        Err(err) => {
-                            let _ = status.blocking_send(Message::Error(err));
-                            state = State::Error(retry_count)
-                        }
-                    };
-                }
-                State::Connected(closed, shutdown) => {
-                    while let None = closed.recv() {
-                        println!("tick");
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-
-                    shutdown.send(()).unwrap();
-                    // println!("client deactivate");
-                    // if let Err(err) = client.deactivate() {
-                    //     dbg!(&err);
-                    //     status.try_send(Message::Error(err.into())).unwrap();
-                    // }
-
-                    println!("before connection lost message");
-                    status
-                        .try_send(Message::Error(Error::ConnectionLost))
-                        .unwrap();
-
-                    state = State::Error(0);
-                }
-                State::Error(retry_count) => {
-                    dbg!("error, retrying: {retry_count}");
-                    const SLEEP_TIME_BASE: u64 = 3;
-
-                    let timeout = retry_count * SLEEP_TIME_BASE;
-                    let timeout = Duration::from_secs(timeout);
-
-                    let _ = status.blocking_send(Message::RetryIn(timeout));
-                    // tokio::time::sleep(timeout).await;
-                    std::thread::sleep(timeout);
-
-                    state = State::NotConnected(retry_count + 1);
-                }
-            }
-        }
-    }
-
-    fn start_jack_client(
-        close: Arc<signal_hook::low_level::channel::Channel<bool>>,
+    pub(crate) fn start_jack_client(
+        // close: Arc<signal_hook::low_level::channel::Channel<bool>>,
+        close: Arc<AtomicBool>,
     ) -> Result<jack::AsyncClient<Notifications, Process>, Error> {
-        let (client, _status) = jack::Client::new(
-            "threading_test",
-            jack::ClientOptions::default() | jack::ClientOptions::NO_START_SERVER,
-        )?;
+        println!("start jack client");
 
+        let (client, _status) =
+            jack::Client::new("threading_test", jack::ClientOptions::default())?;
+
+        println!("start jack client, register port");
+        client.register_port("rust_in_l", jack::AudioIn::default())?;
+
+        println!("start jack client, activate async");
         Ok(client.activate_async(Notifications(close), Process)?)
     }
 
-    enum State {
-        NotConnected(u64),
-        Connected(
-            // jack::AsyncClient<Notifications, Process>,
-            Arc<signal_hook::low_level::channel::Channel<bool>>,
-            oneshot::Sender<()>,
-        ),
-        Error(u64),
-    }
-
-    struct Notifications(Arc<signal_hook::low_level::channel::Channel<bool>>);
-    struct Process;
+    // struct Notifications(Arc<signal_hook::low_level::channel::Channel<bool>>);
+    pub(crate) struct Notifications(pub Arc<AtomicBool>);
+    pub(crate) struct Process;
 
     impl jack::NotificationHandler for Notifications {
         fn thread_init(&self, _: &jack::Client) {}
 
         unsafe fn shutdown(&mut self, _status: jack::ClientStatus, _reason: &str) {
-            self.0.send(true);
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
         }
 
         fn freewheel(&mut self, _: &jack::Client, _is_freewheel_enabled: bool) {}
