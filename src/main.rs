@@ -1,20 +1,44 @@
+use std::time::Duration;
+
+use audio::run_audio_backend;
 use tokio::sync::mpsc;
 
-#[tokio::main]
-async fn main() {
-    let (sender, mut receiver) = mpsc::channel(100);
+// #[tokio::main]
+// async fn main() {
+fn main() {
+    // let (sender, mut receiver) = mpsc::channel(100);
 
-    tokio::task::spawn(audio::run_subscription(sender));
+    // tokio::task::spawn(audio::run_subscription(sender));
 
-    while let Some(message) = receiver.recv().await {
-        dbg!(message);
-    }
+    // while let Some(message) = receiver.recv().await {
+    //     dbg!(message);
+    // }
+    let (status_sender, mut status_receiver) = mpsc::channel(100);
+
+    std::thread::spawn(|| run_audio_backend(status_sender));
+
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(event) = status_receiver.try_recv() {
+                dbg!(event);
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        // while let Ok(event) = status_receiver.try_recv() {
+        //     dbg!(event);
+        // }
+    })
+    .join()
+    .unwrap()
 }
 
 mod audio {
     use std::{sync::Arc, time::Duration};
 
-    use tokio::sync::mpsc::{self};
+    use tokio::sync::{
+        mpsc::{self},
+        oneshot,
+    };
 
     #[derive(Debug, Clone)]
     pub enum Message {
@@ -35,17 +59,47 @@ mod audio {
         println!("Subscription ended.")
     }
 
-    fn run_audio_backend(status: mpsc::Sender<Message>) {
+    pub fn run_audio_backend(status: mpsc::Sender<Message>) {
         let mut state = State::NotConnected(0);
 
         loop {
             match state {
                 State::NotConnected(retry_count) => {
                     let close_channel = Arc::new(signal_hook::low_level::channel::Channel::new());
-                    match start_jack_client(close_channel.clone()) {
-                        Ok(client) => {
+
+                    let (result_tx, result_rx) = oneshot::channel();
+                    let (shutdown, mut shutdown_rx) = oneshot::channel();
+
+                    let close = close_channel.clone();
+                    std::thread::spawn(move || {
+                        let _client = match start_jack_client(close) {
+                            Ok(client) => {
+                                result_tx.send(Ok(())).unwrap();
+                                client
+                            }
+                            Err(err) => {
+                                result_tx.send(Err(err)).unwrap();
+                                return;
+                            }
+                        };
+
+                        while let Err(_) = shutdown_rx.try_recv() {
+                            println!("worker tick");
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+
+                        println!("deactivate client");
+                        // SEGFAULT directly
+                        // let _ = client.deactivate().unwrap();
+                        std::thread::sleep(Duration::from_secs(3));
+                        println!("client deactivated");
+                        // SEGFAULT on drop
+                    });
+
+                    match result_rx.blocking_recv().unwrap() {
+                        Ok(_) => {
                             let _ = status.blocking_send(Message::Ready);
-                            state = State::Connected(client, close_channel);
+                            state = State::Connected(close_channel, shutdown);
                         }
                         Err(err) => {
                             let _ = status.blocking_send(Message::Error(err));
@@ -53,18 +107,23 @@ mod audio {
                         }
                     };
                 }
-                State::Connected(client, ref mut closed) => {
+                State::Connected(closed, shutdown) => {
                     while let None = closed.recv() {
-                        std::thread::sleep(Duration::from_millis(10));
+                        println!("tick");
+                        std::thread::sleep(Duration::from_millis(500));
                     }
 
+                    shutdown.send(()).unwrap();
+                    // println!("client deactivate");
+                    // if let Err(err) = client.deactivate() {
+                    //     dbg!(&err);
+                    //     status.try_send(Message::Error(err.into())).unwrap();
+                    // }
+
+                    println!("before connection lost message");
                     status
                         .try_send(Message::Error(Error::ConnectionLost))
                         .unwrap();
-
-                    if let Err(err) = client.deactivate() {
-                        status.try_send(Message::Error(err.into())).unwrap();
-                    }
 
                     state = State::Error(0);
                 }
@@ -88,8 +147,10 @@ mod audio {
     fn start_jack_client(
         close: Arc<signal_hook::low_level::channel::Channel<bool>>,
     ) -> Result<jack::AsyncClient<Notifications, Process>, Error> {
-        let (client, _status) =
-            jack::Client::new("threading_test", jack::ClientOptions::NO_START_SERVER)?;
+        let (client, _status) = jack::Client::new(
+            "threading_test",
+            jack::ClientOptions::default() | jack::ClientOptions::NO_START_SERVER,
+        )?;
 
         Ok(client.activate_async(Notifications(close), Process)?)
     }
@@ -97,8 +158,9 @@ mod audio {
     enum State {
         NotConnected(u64),
         Connected(
-            jack::AsyncClient<Notifications, Process>,
+            // jack::AsyncClient<Notifications, Process>,
             Arc<signal_hook::low_level::channel::Channel<bool>>,
+            oneshot::Sender<()>,
         ),
         Error(u64),
     }
