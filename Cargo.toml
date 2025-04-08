@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 jack = "0.13"
+# jack = { path = "../extern/rust-jack" }
 signal-hook = { version = "0.3", features = ["channel"], default-features = false }
 thiserror = "2"
 
